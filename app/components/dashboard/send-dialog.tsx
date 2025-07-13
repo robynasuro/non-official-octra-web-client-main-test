@@ -42,7 +42,7 @@ export function SendDialog({ children }: SendDialogProps) {
   const [batchAmount, setBatchAmount] = useState('');
   const [batchMessage, setBatchMessage] = useState('');
 
-  const { balance, nonce, isLoading: balanceLoading } = useWalletBalance();
+  const { publicBalance: balance, nonce, isLoading: balanceLoading } = useWalletBalance();
   const { sendTransaction, isLoading: isSending } = useSendTransaction();
 
   const addressRegex = /^oct[1-9A-HJ-NP-Za-km-z]{44}$/;

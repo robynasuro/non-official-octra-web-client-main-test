@@ -1,14 +1,15 @@
 import useSWR, { useSWRConfig } from 'swr';
 import { useWallet } from '@/context/WalletContext';
-import { fetcher } from '@/lib/api';
 import nacl from 'tweetnacl';
 import { encodeBase64 } from 'tweetnacl-util';
-import { useState } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { getKeyPair } from "@/lib/crypto";
-import { useMemo } from "react";
 import { sha256 } from 'js-sha256';
 
-// Helper function to derive encryption key (matches CLI implementation)
+const MU_FACTOR = 1_000_000;
+const DEFAULT_RPC_URL = 'https://octra.network';
+
+// Helper function to derive encryption key
 const deriveEncryptionKey = (privkeyB64: string): Uint8Array => {
   const privkeyBytes = Buffer.from(privkeyB64, 'base64');
   const salt = new TextEncoder().encode("octra_encrypted_balance_v2");
@@ -20,7 +21,7 @@ const deriveEncryptionKey = (privkeyB64: string): Uint8Array => {
   return hash.slice(0, nacl.secretbox.keyLength);
 };
 
-// Helper function to encrypt balance (matches CLI implementation)
+// Helper function to encrypt balance
 const encryptClientBalance = (balance: number, privkeyB64: string): string => {
   const key = deriveEncryptionKey(privkeyB64);
   const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
@@ -37,34 +38,99 @@ const encryptClientBalance = (balance: number, privkeyB64: string): string => {
   return "v2|" + encodeBase64(combined);
 };
 
-// Wallet balance hook
+// Enhanced proxy fetcher with better error handling
+const createProxyFetcher = (wallet: { privateKey: string } | null) => {
+  return async ([endpoint, rpcUrl = DEFAULT_RPC_URL, payload]: [string, string?, any?]) => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+
+    if (wallet?.privateKey) {
+      headers['Authorization'] = `Bearer ${wallet.privateKey}`;
+    }
+
+    try {
+      const response = await fetch('/api/proxy', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          method: 'GET',
+          endpoint,
+          rpcUrl,
+          payload
+        })
+      });
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        console.error('API Error:', {
+          endpoint,
+          status: response.status,
+          error
+        });
+        throw new Error(error.error || 'Request failed');
+      }
+
+      const data = await response.json();
+      
+      // Ensure numeric values for balance endpoints
+      if (endpoint.startsWith('/balance')) {
+        if (typeof data.balance === 'string') {
+          data.balance = parseFloat(data.balance);
+        }
+        if (typeof data.nonce === 'string') {
+          data.nonce = parseInt(data.nonce);
+        }
+      }
+      
+      return data;
+    } catch (error) {
+      console.error('Fetch Error:', {
+        endpoint,
+        error
+      });
+      throw error;
+    }
+  };
+};
+
+// Wallet balance hook with improved typing and error handling
 export function useWalletBalance() {
   const { wallet } = useWallet();
-  const rpcUrl = 'https://octra.network';
+  const fetcher = useCallback(createProxyFetcher(wallet), [wallet]);
 
-  const balanceKey = wallet ? [`/balance/${wallet.address}`, rpcUrl, {}] : null;
   const { 
     data: balanceData, 
-    error: _balanceError, 
-    isLoading: balanceLoading 
+    error: balanceError, 
+    isLoading: balanceLoading,
+    mutate: mutateBalance
   } = useSWR(
-    balanceKey,
+    wallet ? [`/balance/${wallet.address}`, DEFAULT_RPC_URL] : null,
     fetcher,
-    { refreshInterval: 30000 }
+    { 
+      refreshInterval: 30000,
+      revalidateOnFocus: false,
+      dedupingInterval: 10000,
+      shouldRetryOnError: true,
+      errorRetryCount: 3
+    }
   );
 
-  const stagingKey = wallet ? ['/staging', rpcUrl] : null;
   const { 
     data: stagingData, 
-    error: _stagingError, 
-    isLoading: stagingLoading 
+    error: stagingError, 
+    isLoading: stagingLoading,
+    mutate: mutateStaging
   } = useSWR(
-    stagingKey,
+    wallet ? ['/staging', DEFAULT_RPC_URL] : null,
     fetcher,
-    { refreshInterval: 30000 }
+    { 
+      refreshInterval: 30000,
+      revalidateOnFocus: false
+    }
   );
 
-  const getCombinedNonce = () => {
+  const getCombinedNonce = useCallback(() => {
     if (!wallet || !balanceData) return balanceData?.nonce;
     const baseNonce = balanceData.nonce ?? 0;
     if (stagingData?.staged_transactions) {
@@ -75,12 +141,33 @@ export function useWalletBalance() {
       }
     }
     return baseNonce;
-  };
+  }, [wallet, balanceData, stagingData]);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([
+      mutateBalance(),
+      mutateStaging()
+    ]);
+  }, [mutateBalance, mutateStaging]);
+
+  // Enhanced balance logging
+  useEffect(() => {
+    if (balanceData) {
+      console.log('Balance updated:', {
+        balance: balanceData.balance,
+        nonce: balanceData.nonce,
+        recentTransactions: balanceData.recent_transactions?.length || 0,
+        time: new Date().toISOString()
+      });
+    }
+  }, [balanceData]);
 
   return {
-    balance: balanceData?.balance || 0,
+    publicBalance: balanceData?.balance || 0,
     nonce: getCombinedNonce() || 0,
     isLoading: balanceLoading || stagingLoading,
+    refresh,
+    error: balanceError || stagingError
   };
 }
 
@@ -113,58 +200,77 @@ export interface ProcessedTransaction {
   isPrivate?: boolean;
 }
 
-// Enhanced transaction history hook
 export function useTransactionHistory() {
   const { wallet } = useWallet();
-  const rpcUrl = 'https://octra.network';
+  const fetcher = useCallback(createProxyFetcher(wallet), [wallet]);
 
   // Regular transactions
-  const stagingKey = wallet ? ['/staging', rpcUrl] : null;
-  const { data: stagingData } = useSWR(stagingKey, fetcher, { 
-    refreshInterval: 30000, 
-    revalidateOnFocus: false 
-  });
-
-  const addressKey = wallet ? [`/balance/${wallet.address}?limit=20`, rpcUrl, {}] : null;
-  const { 
-    data: addressData, 
-    error: _addressError, 
-    isLoading: addressLoading 
-  } = useSWR(
-    addressKey,
+  const { data: addressData, mutate: mutateAddress } = useSWR(
+    wallet ? [`/balance/${wallet.address}?limit=20`, DEFAULT_RPC_URL] : null,
     fetcher,
-    { refreshInterval: 60000, revalidateOnFocus: false }
+    { 
+      refreshInterval: 60000, 
+      revalidateOnFocus: false 
+    }
   );
 
   // Private transactions
-  const privateTxKey = wallet ? [`/private_transactions/${wallet.address}`, rpcUrl] : null;
-  const { data: privateTxData } = useSWR(privateTxKey, fetcher, {
-    refreshInterval: 30000,
-    revalidateOnFocus: false
-  });
+  const { data: privateTxData, mutate: mutatePrivateTx } = useSWR(
+    wallet ? [`/private_transactions/${wallet.address}`, DEFAULT_RPC_URL] : null,
+    fetcher,
+    {
+      refreshInterval: 30000,
+      revalidateOnFocus: false
+    }
+  );
+
+  // Pending private transfers
+  const { data: pendingPrivateData, mutate: mutatePendingPrivate } = useSWR(
+    wallet ? [`/pending_private_transfers/${wallet.address}`, DEFAULT_RPC_URL] : null,
+    fetcher,
+    {
+      refreshInterval: 30000,
+      revalidateOnFocus: false
+    }
+  );
 
   // Transaction details
   const transactionHashes = addressData?.recent_transactions?.map((tx: TransactionReference) => tx.hash) || [];
-  const transactionDetailsKey = transactionHashes.length > 0 && wallet ? ['transaction-details', transactionHashes, rpcUrl] : null;
   const { 
     data: transactionDetails, 
-    error: _detailsError, 
-    isLoading: detailsLoading 
+    error: detailsError, 
+    isLoading: detailsLoading,
+    mutate: mutateDetails
   } = useSWR(
-    transactionDetailsKey,
+    transactionHashes.length > 0 && wallet ? ['transaction-details', transactionHashes, DEFAULT_RPC_URL] : null,
     async ([_, hashes, rpcUrl]) => {
       const transactionPromises = hashes.map(async (hash: string) => {
         try { 
-          return { hash, data: await fetcher([`/tx/${hash}`, rpcUrl]) }; 
-        } catch (_) { 
+          const data = await fetcher([`/tx/${hash}`, rpcUrl]);
+          return { hash, data }; 
+        } catch (error) { 
+          console.error('Failed to fetch tx details:', hash, error);
           return null; 
         }
       });
       const results = await Promise.all(transactionPromises);
       return results.filter(result => result !== null);
     },
-    { refreshInterval: 60000, revalidateOnFocus: false, dedupingInterval: 30000 }
+    { 
+      refreshInterval: 60000, 
+      revalidateOnFocus: false, 
+      dedupingInterval: 30000 
+    }
   );
+
+  const refresh = useCallback(async () => {
+    await Promise.all([
+      mutateAddress(),
+      mutatePrivateTx(),
+      mutatePendingPrivate(),
+      mutateDetails()
+    ]);
+  }, [mutateAddress, mutatePrivateTx, mutatePendingPrivate, mutateDetails]);
 
   const processedTransactions = useMemo((): ProcessedTransaction[] => {
     if (!wallet?.address) return [];
@@ -174,10 +280,30 @@ export function useTransactionHistory() {
     
     const parseAmount = (amountRaw: string | undefined): number => {
       const amountStr = String(amountRaw || '0');
-      return amountStr.includes('.') ? parseFloat(amountStr) : parseInt(amountStr) / 1_000_000;
+      return amountStr.includes('.') ? parseFloat(amountStr) : parseInt(amountStr) / MU_FACTOR;
     };
 
-    // Process private transactions first
+    // Process pending private transfers
+    if (pendingPrivateData?.pending_transfers) {
+      pendingPrivateData.pending_transfers.forEach((tx: any) => {
+        if (processedHashes.has(tx.id)) return;
+        
+        finalTransactions.push({
+          time: new Date(tx.created_at * 1000),
+          hash: tx.id,
+          amount: parseAmount(tx.amount),
+          to: tx.recipient === wallet.address ? tx.sender : tx.recipient,
+          type: tx.recipient === wallet.address ? 'in' : 'out',
+          ok: true,
+          nonce: tx.nonce,
+          isPrivate: true,
+          message: tx.message
+        });
+        processedHashes.add(tx.id);
+      });
+    }
+
+    // Process private transactions
     if (privateTxData?.transactions) {
       privateTxData.transactions.forEach((tx: any) => {
         if (processedHashes.has(tx.hash)) return;
@@ -224,46 +350,29 @@ export function useTransactionHistory() {
       });
     }
 
-    // Process staged transactions
-    if (stagingData?.staged_transactions) {
-      const ourStagedTxs = stagingData.staged_transactions.filter(
-        (tx: any) => tx.from === wallet.address && tx.hash && !processedHashes.has(tx.hash)
-      );
-      ourStagedTxs.forEach((stagedTx: any) => {
-        const isIncoming = stagedTx.to === wallet.address;
-        finalTransactions.push({
-          time: new Date(stagedTx.timestamp * 1000),
-          hash: stagedTx.hash,
-          amount: parseAmount(stagedTx.amount_raw || stagedTx.amount),
-          to: isIncoming ? stagedTx.from : stagedTx.to,
-          type: isIncoming ? 'in' : 'out',
-          ok: true,
-          nonce: stagedTx.nonce,
-          epoch: undefined,
-          message: stagedTx.message || undefined,
-          isPrivate: false
-        });
-        processedHashes.add(stagedTx.hash);
-      });
-    }
+    return finalTransactions
+      .sort((a, b) => b.time.getTime() - a.time.getTime())
+      .slice(0, 50);
+  }, [wallet?.address, privateTxData, pendingPrivateData, transactionDetails, addressData?.recent_transactions]);
 
-    return finalTransactions.sort((a, b) => b.time.getTime() - a.time.getTime()).slice(0, 50);
-  }, [wallet?.address, privateTxData, transactionDetails, addressData?.recent_transactions, stagingData]);
-
-  const isLoading = addressLoading || detailsLoading;
+  const isLoading = detailsLoading;
   
   return { 
     history: processedTransactions, 
-    isLoading
+    isLoading,
+    refresh,
+    pendingPrivateTransfers: pendingPrivateData?.pending_transfers || [],
+    error: detailsError
   };
 }
 
-// Send transaction hook
+// Send transaction hook with enhanced error handling
 interface SendTransactionParams { 
   to: string; 
   amount: number; 
   _nonce?: number; 
   message?: string; 
+  isPrivate?: boolean;
 }
 
 interface SendTransactionResult { 
@@ -273,20 +382,21 @@ interface SendTransactionResult {
   responseTime?: number; 
   poolInfo?: any; 
   message?: string; 
+  ephemeralKey?: string;
 }
 
 export function useSendTransaction() {
   const { wallet } = useWallet();
-  const { nonce, balance } = useWalletBalance();
+  const { nonce, publicBalance: balance, refresh: refreshBalance } = useWalletBalance();
   const [isLoading, setIsLoading] = useState(false);
   const { mutate } = useSWRConfig();
-  const rpcUrl = 'https://octra.network';
 
   const sendTransaction = async ({ 
     to, 
     amount, 
     _nonce, 
-    message 
+    message,
+    isPrivate = false
   }: SendTransactionParams): Promise<SendTransactionResult> => {
     if (!wallet) return { success: false, error: 'Wallet not connected' };
     
@@ -303,7 +413,7 @@ export function useSendTransaction() {
       const transaction = { 
         from: wallet.address, 
         to_: to, 
-        amount: String(Math.floor(amount * 1_000_000)), 
+        amount: String(Math.floor(amount * MU_FACTOR)), 
         nonce: _nonce ? _nonce : currentNonce + 1, 
         ou: amount < 1000 ? "1" : "3", 
         timestamp: Date.now() / 1000 + Math.random() * 0.01, 
@@ -324,6 +434,12 @@ export function useSendTransaction() {
         public_key: publicKeyB64 
       };
       
+      const endpoint = isPrivate ? '/private_transfer' : '/send-tx';
+      const payload = isPrivate ? {
+        ...signedTransaction,
+        from_private_key: wallet.privateKey
+      } : signedTransaction;
+      
       const startTime = Date.now();
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -332,13 +448,13 @@ export function useSendTransaction() {
         method: 'POST', 
         headers: { 
           'Content-Type': 'application/json',
-          'X-Private-Key': wallet.privateKey
+          'Authorization': `Bearer ${wallet.privateKey}`
         }, 
         body: JSON.stringify({ 
           method: 'POST', 
-          endpoint: '/send-tx', 
-          rpcUrl, 
-          payload: signedTransaction 
+          endpoint, 
+          rpcUrl: DEFAULT_RPC_URL, 
+          payload
         }), 
         signal: controller.signal 
       });
@@ -347,7 +463,12 @@ export function useSendTransaction() {
       const responseTime = (Date.now() - startTime) / 1000;
       
       if (!response.ok) {
-        const errorData = await response.json();
+        const errorData = await response.json().catch(() => ({}));
+        console.error('Transaction failed:', {
+          endpoint,
+          status: response.status,
+          error: errorData
+        });
         return { 
           success: false, 
           error: errorData.error || 'Transaction failed', 
@@ -357,40 +478,30 @@ export function useSendTransaction() {
       
       const result = await response.json();
       let txHash: string | undefined;
+      let ephemeralKey: string | undefined;
       let success = false;
       
       if (result.status === 'accepted') { 
         success = true; 
-        txHash = result.tx_hash; 
+        txHash = result.tx_hash;
+        ephemeralKey = result.ephemeral_key;
       } else if (typeof result === 'string' && result.toLowerCase().startsWith('ok')) { 
         success = true; 
         txHash = result.split(' ').pop(); 
       }
       
       if (success && txHash) {
-        // Update local cache
-        const stagingKey = ['/staging', rpcUrl];
-        mutate(stagingKey, (currentData: any) => {
-          const newStagedTx = { 
-            from: wallet.address, 
-            to, 
-            amount: String(Math.floor(amount * 1_000_000)), 
-            nonce: currentNonce + 1, 
-            hash: txHash, 
-            timestamp: Date.now() / 1000, 
-            message: message || undefined 
-          };
-          return { 
-            ...(currentData || {}), 
-            staged_transactions: [newStagedTx, ...(currentData?.staged_transactions || [])] 
-          };
-        }, { revalidate: false });
-        
-        mutate([`/balance/${wallet.address}`, rpcUrl, {}]);
+        // Invalidate all relevant caches
+        await Promise.all([
+          refreshBalance(),
+          mutate([`/balance/${wallet.address}`, DEFAULT_RPC_URL]),
+          mutate(['/staging', DEFAULT_RPC_URL])
+        ]);
         
         return { 
           success, 
           txHash, 
+          ephemeralKey,
           responseTime, 
           poolInfo: result.pool_info, 
           message: message || undefined 
@@ -403,6 +514,7 @@ export function useSendTransaction() {
         };
       }
     } catch (error) {
+      console.error('Transaction error:', error);
       return { 
         success: false, 
         error: error instanceof Error ? error.message : 'Unknown error occurred' 
@@ -418,39 +530,11 @@ export function useSendTransaction() {
   };
 }
 
-// Encryption/decryption hook
+// Encryption/decryption hook with improved error handling
 export function useEncryptDecrypt() {
   const { wallet } = useWallet();
-  const { mutate } = useSWRConfig();
   const [isLoading, setIsLoading] = useState(false);
-  const rpcUrl = 'https://octra.network';
-
-  const getEncryptedBalance = async (): Promise<any> => {
-    if (!wallet) return null;
-    
-    try {
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'GET',
-          endpoint: `/view_encrypted_balance/${wallet.address}`,
-          rpcUrl
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      return await response.json();
-    } catch (error) {
-      console.error('Error fetching encrypted balance:', error);
-      return null;
-    }
-  };
+  const { mutate } = useSWRConfig();
 
   const encryptDecryptBalance = async (
     amount: number, 
@@ -460,26 +544,42 @@ export function useEncryptDecrypt() {
     
     setIsLoading(true);
     try {
-      const encData = await getEncryptedBalance();
-      if (!encData) {
-        return { success: false, error: 'Failed to get encrypted balance' };
+      // Get current encrypted balance
+      const encData = await fetch('/api/proxy', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${wallet.privateKey}`
+        },
+        body: JSON.stringify({
+          method: 'GET',
+          endpoint: `/view_encrypted_balance/${wallet.address}`,
+          rpcUrl: DEFAULT_RPC_URL
+        })
+      });
+      
+      if (!encData.ok) {
+        const error = await encData.json().catch(() => ({}));
+        throw new Error(error.error || 'Failed to get encrypted balance');
       }
-
-      const currentEncrypted = encData.encrypted_raw || 0;
-      const amountRaw = Math.floor(amount * 1_000_000);
-      let newEncrypted: number;
-
+      
+      const balanceData = await encData.json();
+      const currentEncryptedRaw = parseInt(balanceData.encrypted_balance_raw || '0');
+      const amountRaw = Math.floor(amount * MU_FACTOR);
+      
+      let newEncryptedRaw: number;
       if (action === 'encrypt') {
-        newEncrypted = currentEncrypted + amountRaw;
+        newEncryptedRaw = currentEncryptedRaw + amountRaw;
       } else {
-        if (currentEncrypted < amountRaw) {
-          return { success: false, error: 'Insufficient encrypted balance' };
+        if (currentEncryptedRaw < amountRaw) {
+          throw new Error('Insufficient encrypted balance');
         }
-        newEncrypted = currentEncrypted - amountRaw;
+        newEncryptedRaw = currentEncryptedRaw - amountRaw;
       }
-
-      const encryptedValue = encryptClientBalance(newEncrypted, wallet.privateKey);
-
+      
+      // Encrypt the new balance
+      const encryptedValue = encryptClientBalance(newEncryptedRaw, wallet.privateKey);
+      
       const endpoint = action === 'encrypt' ? '/encrypt_balance' : '/decrypt_balance';
       const payload = {
         address: wallet.address,
@@ -496,12 +596,12 @@ export function useEncryptDecrypt() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'X-Private-Key': wallet.privateKey
+          'Authorization': `Bearer ${wallet.privateKey}`
         },
         body: JSON.stringify({
           method: 'POST',
           endpoint,
-          rpcUrl,
+          rpcUrl: DEFAULT_RPC_URL,
           payload
         }),
         signal: controller.signal
@@ -511,8 +611,12 @@ export function useEncryptDecrypt() {
       const responseTime = (Date.now() - startTime) / 1000;
 
       if (!response.ok) {
-        const errorData = await response.json();
-        console.error('API Error:', errorData);
+        const errorData = await response.json().catch(() => ({}));
+        console.error('API Error:', {
+          endpoint,
+          status: response.status,
+          error: errorData
+        });
         return { 
           success: false, 
           error: errorData?.error || `Transaction failed with status ${response.status}`, 
@@ -523,7 +627,13 @@ export function useEncryptDecrypt() {
       const result = await response.json();
       if (result.status === 'accepted' || (typeof result === 'string' && result.toLowerCase().startsWith('ok'))) {
         const txHash = result.tx_hash || (typeof result === 'string' ? result.split(' ').pop() : undefined);
-        mutate([`/balance/${wallet.address}`, rpcUrl, {}]);
+        
+        // Invalidate all relevant caches
+        await Promise.all([
+          mutate([`/balance/${wallet.address}`, DEFAULT_RPC_URL]),
+          mutate([`/view_encrypted_balance/${wallet.address}`, DEFAULT_RPC_URL])
+        ]);
+        
         return { 
           success: true, 
           txHash, 
@@ -538,7 +648,7 @@ export function useEncryptDecrypt() {
         };
       }
     } catch (error) {
-      console.error('Error:', error);
+      console.error('Encrypt/Decrypt error:', error);
       return { 
         success: false, 
         error: error instanceof Error ? error.message : 'Unknown error occurred' 
@@ -554,45 +664,147 @@ export function useEncryptDecrypt() {
   };
 }
 
-// Encrypted balance hook
+// Encrypted balance hook with improved typing
 export function useEncryptedBalance() {
   const { wallet } = useWallet();
-  const rpcUrl = 'https://octra.network';
+  const fetcher = useCallback(createProxyFetcher(wallet), [wallet]);
   
   const { 
     data: encryptedBalanceData, 
-    error: _encryptedBalanceError, 
-    isLoading: encryptedBalanceLoading 
+    error: encryptedBalanceError, 
+    isLoading: encryptedBalanceLoading,
+    mutate: mutateEncryptedBalance
   } = useSWR(
-    wallet ? ['encrypted-balance', wallet.address] : null,
-    async () => {
-      if (!wallet) return null;
-      
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'GET',
-          endpoint: `/view_encrypted_balance/${wallet.address}`,
-          rpcUrl
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error(`Failed to fetch encrypted balance: ${response.status}`);
-      }
-      return await response.json();
-    },
-    { refreshInterval: 30000 }
+    wallet ? [`/view_encrypted_balance/${wallet.address}`, DEFAULT_RPC_URL] : null,
+    fetcher,
+    { 
+      refreshInterval: 30000,
+      revalidateOnFocus: false
+    }
   );
+
+  const refresh = useCallback(() => {
+    mutateEncryptedBalance();
+  }, [mutateEncryptedBalance]);
+
+  useEffect(() => {
+    if (encryptedBalanceData) {
+      console.log('Encrypted balance updated:', {
+        public: encryptedBalanceData.public_balance,
+        private: encryptedBalanceData.encrypted_balance,
+        total: encryptedBalanceData.total_balance,
+        time: new Date().toISOString()
+      });
+    }
+  }, [encryptedBalanceData]);
 
   return {
     publicBalance: encryptedBalanceData?.public_balance || 0,
     encryptedBalance: encryptedBalanceData?.encrypted_balance || 0,
     totalBalance: encryptedBalanceData?.total_balance || 0,
+    publicRaw: parseInt(encryptedBalanceData?.public_balance_raw || '0'),
+    encryptedRaw: parseInt(encryptedBalanceData?.encrypted_balance_raw || '0'),
     isLoading: encryptedBalanceLoading,
+    refresh,
+    error: encryptedBalanceError
+  };
+}
+
+// Private transfers hook with enhanced error handling
+export function usePrivateTransfers() {
+  const { wallet } = useWallet();
+  const [isLoading, setIsLoading] = useState(false);
+  const { mutate } = useSWRConfig();
+  
+  const getPendingPrivateTransfers = async () => {
+    if (!wallet) return [];
+    
+    setIsLoading(true);
+    try {
+      const response = await fetch('/api/proxy', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${wallet.privateKey}`
+        },
+        body: JSON.stringify({
+          method: 'GET',
+          endpoint: `/pending_private_transfers/${wallet.address}`,
+          rpcUrl: DEFAULT_RPC_URL
+        })
+      });
+      
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || 'Failed to fetch pending transfers');
+      }
+      
+      const data = await response.json();
+      return data.pending_transfers || [];
+    } catch (error) {
+      console.error('Error fetching pending transfers:', error);
+      return [];
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const claimPrivateTransfer = async (transferId: string) => {
+    if (!wallet) return { success: false, error: 'Wallet not connected' };
+    
+    setIsLoading(true);
+    try {
+      const response = await fetch('/api/proxy', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${wallet.privateKey}`
+        },
+        body: JSON.stringify({
+          method: 'POST',
+          endpoint: '/claim_private_transfer',
+          rpcUrl: DEFAULT_RPC_URL,
+          payload: {
+            transfer_id: transferId,
+            recipient_address: wallet.address,
+            private_key: wallet.privateKey
+          }
+        })
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Claim failed');
+      }
+      
+      const result = await response.json();
+      
+      // Invalidate all relevant caches
+      await Promise.all([
+        mutate([`/balance/${wallet.address}`, DEFAULT_RPC_URL]),
+        mutate([`/pending_private_transfers/${wallet.address}`, DEFAULT_RPC_URL]),
+        mutate([`/view_encrypted_balance/${wallet.address}`, DEFAULT_RPC_URL])
+      ]);
+      
+      return { 
+        success: true, 
+        amount: result.amount,
+        txHash: result.tx_hash
+      };
+    } catch (error) {
+      console.error('Claim error:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Claim failed' 
+      };
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return {
+    getPendingPrivateTransfers,
+    claimPrivateTransfer,
+    isLoading
   };
 }

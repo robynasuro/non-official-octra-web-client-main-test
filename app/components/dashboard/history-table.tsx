@@ -1,9 +1,8 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { AlertCircle, ArrowDownLeft, ArrowUpRight, Copy, Loader2 } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Copy, Loader2 } from "lucide-react";
 import { useTransactionHistory } from "@/hooks/use-wallet-data";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 
@@ -36,7 +35,7 @@ const handleCopy = (text: string) => {
 };
 
 export function HistoryTable() {
-  const {history, isLoading, error} = useTransactionHistory();
+  const { history, isLoading } = useTransactionHistory();
 
   return (
     <Card className="h-full">
@@ -49,13 +48,7 @@ export function HistoryTable() {
             <Loader2 className="h-8 w-8 animate-spin text-muted-foreground"/>
           </div>
         )}
-        {error && (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4"/>
-            <AlertDescription>{error.message}</AlertDescription>
-          </Alert>
-        )}
-        {!isLoading && !error && (
+        {!isLoading && (
           <div className="overflow-x-auto">
             <Table>
               <TableHeader>
@@ -114,8 +107,14 @@ export function HistoryTable() {
                         <TooltipProvider>
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <Button variant="ghost" size="icon" className="cursor-pointer"
-                                      onClick={() => handleCopy(tx.to)}><Copy className="w-4 h-4 text-muted-foreground"/></Button>
+                              <Button 
+                                variant="ghost" 
+                                size="icon" 
+                                className="cursor-pointer"
+                                onClick={() => handleCopy(tx.to)}
+                              >
+                                <Copy className="w-4 h-4 text-muted-foreground"/>
+                              </Button>
                             </TooltipTrigger>
                             <TooltipContent><p>Copy Address</p></TooltipContent>
                           </Tooltip>
@@ -160,7 +159,7 @@ export function HistoryTable() {
             </Table>
           </div>
         )}
-        {!isLoading && !error && history.length > 0 && (
+        {!isLoading && history.length > 0 && (
           <div className="mt-4 text-sm text-muted-foreground text-center">
             Showing {history.length} most recent transactions
           </div>
