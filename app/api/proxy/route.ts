@@ -1,7 +1,8 @@
-// app/api/proxy/route.ts
 import { NextResponse } from 'next/server';
+import { validatePrivateKey } from '@/lib/crypto';
 
-const ALLOWED_ENDPOINTS = [
+// Define allowed endpoints with TypeScript
+const ALLOWED_ENDPOINTS: string[] = [
   '/balance',
   '/staging',
   '/tx',
@@ -10,7 +11,7 @@ const ALLOWED_ENDPOINTS = [
   '/view_encrypted_balance'
 ];
 
-const PRIVATE_ENDPOINTS = [
+const PRIVATE_ENDPOINTS: string[] = [
   '/encrypt_balance',
   '/decrypt_balance',
   '/private_transfer',
@@ -18,7 +19,12 @@ const PRIVATE_ENDPOINTS = [
   '/send-tx'
 ];
 
-const CORS_HEADERS = {
+// Security headers TypeScript interface
+interface SecurityHeaders {
+  [key: string]: string;
+}
+
+const CORS_HEADERS: SecurityHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Private-Key',
@@ -26,14 +32,14 @@ const CORS_HEADERS = {
   'Access-Control-Expose-Headers': '*'
 };
 
-const SECURITY_HEADERS = {
+const SECURITY_HEADERS: SecurityHeaders = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'X-XSS-Protection': '1; mode=block',
 };
 
 const DEFAULT_RPC_URL = process.env.DEFAULT_RPC_URL || 'https://octra.network';
-const REQUEST_TIMEOUT = 15000;
+const REQUEST_TIMEOUT = 15000; // 15 seconds
 
 export async function OPTIONS() {
   return new NextResponse(null, {
@@ -64,11 +70,10 @@ export async function POST(request: Request) {
       );
     }
 
-    const { method = 'GET', endpoint, rpcUrl = DEFAULT_RPC_URL, payload } = await request.json();
-    const authHeader = request.headers.get('Authorization');
-    const privateKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-
-    // Validate endpoint
+    // Parse and validate request body
+    const requestBody = await request.json();
+    const { method = 'GET', endpoint, rpcUrl = DEFAULT_RPC_URL, payload } = requestBody;
+    
     if (!endpoint || typeof endpoint !== 'string') {
       return NextResponse.json(
         { error: 'Missing or invalid endpoint' },
@@ -82,16 +87,50 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check if endpoint is allowed
-    const isAllowed = ALLOWED_ENDPOINTS.some(allowedEndpoint => 
-      endpoint.startsWith(allowedEndpoint)
-    );
-    
-    const isPrivate = PRIVATE_ENDPOINTS.some(privateEndpoint => 
-      endpoint.startsWith(privateEndpoint)
-    );
+    // Authenticate private endpoints
+    const authHeader = request.headers.get('Authorization');
+    const privateKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    const xPrivateKey = request.headers.get('X-Private-Key');
 
-    if (!isAllowed && !isPrivate) {
+    // Validate private key if required
+    const isPrivate = PRIVATE_ENDPOINTS.some(pe => endpoint.startsWith(pe));
+    if (isPrivate) {
+      if (!privateKey && !xPrivateKey) {
+        return NextResponse.json(
+          { error: 'Private key required for this endpoint' },
+          { 
+            status: 401, 
+            headers: { 
+              ...CORS_HEADERS, 
+              ...SECURITY_HEADERS 
+            } 
+          }
+        );
+      }
+
+      try {
+        // Validate the private key format
+        const keyToValidate = privateKey || xPrivateKey;
+        if (keyToValidate) {
+          validatePrivateKey(keyToValidate);
+        }
+      } catch (error) {
+        return NextResponse.json(
+          { error: 'Invalid private key format' },
+          { 
+            status: 401, 
+            headers: { 
+              ...CORS_HEADERS, 
+              ...SECURITY_HEADERS 
+            } 
+          }
+        );
+      }
+    }
+
+    // Check endpoint authorization
+    const isAllowed = ALLOWED_ENDPOINTS.some(ae => endpoint.startsWith(ae)) || isPrivate;
+    if (!isAllowed) {
       return NextResponse.json(
         { error: 'Unauthorized endpoint' },
         { 
@@ -104,24 +143,10 @@ export async function POST(request: Request) {
       );
     }
 
-    if (isPrivate && !privateKey) {
-      return NextResponse.json(
-        { error: 'Private key required for this endpoint' },
-        { 
-          status: 401, 
-          headers: { 
-            ...CORS_HEADERS, 
-            ...SECURITY_HEADERS 
-          } 
-        }
-      );
-    }
-
-    // Construct the target URL with special handling for certain endpoints
+    // Construct target URL with special handling
     let targetUrl: URL;
     try {
       if (endpoint.startsWith('/pending_private_transfers')) {
-        // Special handling for pending transfers endpoint
         targetUrl = new URL(`/api${endpoint}`, rpcUrl);
       } else {
         targetUrl = new URL(endpoint, rpcUrl);
@@ -139,18 +164,19 @@ export async function POST(request: Request) {
       );
     }
 
-    // Add cache buster for endpoints that need fresh data
+    // Add cache buster for balance endpoints
     if (endpoint.startsWith('/balance') || endpoint.startsWith('/pending_private_transfers')) {
       targetUrl.searchParams.append('_', Date.now().toString());
     }
 
-    // Prepare fetch options
+    // Prepare fetch options with TypeScript typing
     const fetchOptions: RequestInit = {
       method,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        ...(privateKey ? { 'X-Private-Key': privateKey } : {})
+        ...(privateKey ? { 'X-Private-Key': privateKey } : {}),
+        ...(xPrivateKey ? { 'X-Private-Key': xPrivateKey } : {})
       },
       signal: controller.signal,
       cache: 'no-store'
@@ -161,29 +187,40 @@ export async function POST(request: Request) {
     }
 
     // Make the request with retry logic
-    let response: Response | undefined;
+    let response: Response | null = null;
     let retryCount = 0;
     const maxRetries = 2;
+    let lastError: unknown = null;
     
     while (retryCount <= maxRetries) {
       try {
         response = await fetch(targetUrl.toString(), fetchOptions);
-        break;
-      } catch (err) {
+        if (response.ok) break;
+        
         if (retryCount === maxRetries) {
-          throw err;
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `Request failed with status ${response.status}`);
         }
-        retryCount++;
-        await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+      } catch (error) {
+        lastError = error;
+        if (retryCount === maxRetries) {
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
       }
+      retryCount++;
     }
 
-    // Check if response was assigned
     if (!response) {
+      throw new Error('No response received after retries');
+    }
+
+    // Handle special case for pending_private_transfers
+    if (endpoint.startsWith('/pending_private_transfers') && response.status === 500) {
       return NextResponse.json(
-        { error: 'No response received after retries' },
+        { pending_transfers: [] },
         { 
-          status: 504,
+          status: 200,
           headers: { 
             ...CORS_HEADERS, 
             ...SECURITY_HEADERS 
@@ -192,27 +229,12 @@ export async function POST(request: Request) {
       );
     }
 
-    // Handle non-OK responses
     if (!response.ok) {
       let errorData;
       try {
         errorData = await response.json();
       } catch {
         errorData = { error: 'Unknown error occurred' };
-      }
-      
-      // Special handling for pending transfers endpoint
-      if (endpoint.startsWith('/pending_private_transfers') && response.status === 500) {
-        return NextResponse.json(
-          [], // Return empty array as fallback
-          { 
-            status: 200,
-            headers: { 
-              ...CORS_HEADERS, 
-              ...SECURITY_HEADERS 
-            }
-          }
-        );
       }
       
       return NextResponse.json(
@@ -231,7 +253,6 @@ export async function POST(request: Request) {
       );
     }
 
-    // Process successful response
     const data = await response.json();
     
     return NextResponse.json(data, { 

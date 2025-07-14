@@ -11,31 +11,41 @@ const DEFAULT_RPC_URL = 'https://octra.network';
 
 // Helper function to derive encryption key
 const deriveEncryptionKey = (privkeyB64: string): Uint8Array => {
-  const privkeyBytes = Buffer.from(privkeyB64, 'base64');
-  const salt = new TextEncoder().encode("octra_encrypted_balance_v2");
-  const combined = new Uint8Array(salt.length + privkeyBytes.length);
-  combined.set(salt);
-  combined.set(privkeyBytes, salt.length);
-  
-  const hash = new Uint8Array(sha256.arrayBuffer(combined));
-  return hash.slice(0, nacl.secretbox.keyLength);
+  try {
+    const privkeyBytes = Buffer.from(privkeyB64, 'base64');
+    const salt = new TextEncoder().encode("octra_encrypted_balance_v2");
+    const combined = new Uint8Array(salt.length + privkeyBytes.length);
+    combined.set(salt);
+    combined.set(privkeyBytes, salt.length);
+    
+    const hash = new Uint8Array(sha256.arrayBuffer(combined));
+    return hash.slice(0, nacl.secretbox.keyLength);
+  } catch (error) {
+    console.error('Key derivation error:', error);
+    throw new Error('Failed to derive encryption key');
+  }
 };
 
 // Helper function to encrypt balance
 const encryptClientBalance = (balance: number, privkeyB64: string): string => {
-  const key = deriveEncryptionKey(privkeyB64);
-  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
-  const plaintext = new TextEncoder().encode(balance.toString());
-  const ciphertext = nacl.secretbox(plaintext, nonce, key);
-  
-  if (!ciphertext) {
-    throw new Error('Encryption failed');
-  }
+  try {
+    const key = deriveEncryptionKey(privkeyB64);
+    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+    const plaintext = new TextEncoder().encode(balance.toString());
+    const ciphertext = nacl.secretbox(plaintext, nonce, key);
+    
+    if (!ciphertext) {
+      throw new Error('Encryption failed');
+    }
 
-  const combined = new Uint8Array(nonce.length + ciphertext.length);
-  combined.set(nonce);
-  combined.set(ciphertext, nonce.length);
-  return "v2|" + encodeBase64(combined);
+    const combined = new Uint8Array(nonce.length + ciphertext.length);
+    combined.set(nonce);
+    combined.set(ciphertext, nonce.length);
+    return "v2|" + encodeBase64(combined);
+  } catch (error) {
+    console.error('Encryption error:', error);
+    throw new Error('Failed to encrypt balance');
+  }
 };
 
 // Enhanced proxy fetcher with better error handling
@@ -47,6 +57,7 @@ const createProxyFetcher = (wallet: { privateKey: string } | null) => {
 
     if (wallet?.privateKey) {
       headers['Authorization'] = `Bearer ${wallet.privateKey}`;
+      headers['X-Private-Key'] = wallet.privateKey;
     }
 
     try {
@@ -58,7 +69,8 @@ const createProxyFetcher = (wallet: { privateKey: string } | null) => {
           endpoint,
           rpcUrl,
           payload
-        })
+        }),
+        signal: AbortSignal.timeout(15000)
       });
 
       if (!response.ok) {
@@ -74,12 +86,18 @@ const createProxyFetcher = (wallet: { privateKey: string } | null) => {
       const data = await response.json();
       
       // Ensure numeric values for balance endpoints
-      if (endpoint.startsWith('/balance')) {
+      if (endpoint.startsWith('/balance') || endpoint.startsWith('/view_encrypted_balance')) {
         if (typeof data.balance === 'string') {
           data.balance = parseFloat(data.balance);
         }
         if (typeof data.nonce === 'string') {
           data.nonce = parseInt(data.nonce);
+        }
+        if (typeof data.encrypted_balance === 'string') {
+          data.encrypted_balance = parseFloat(data.encrypted_balance);
+        }
+        if (typeof data.public_balance === 'string') {
+          data.public_balance = parseFloat(data.public_balance);
         }
       }
       
@@ -131,7 +149,7 @@ export function useWalletBalance() {
   );
 
   const getCombinedNonce = useCallback(() => {
-    if (!wallet || !balanceData) return balanceData?.nonce;
+    if (!wallet || !balanceData) return balanceData?.nonce ?? 0;
     const baseNonce = balanceData.nonce ?? 0;
     if (stagingData?.staged_transactions) {
       const ourStagedTxs = stagingData.staged_transactions.filter((tx: any) => tx.from === wallet.address);
@@ -164,7 +182,7 @@ export function useWalletBalance() {
 
   return {
     publicBalance: balanceData?.balance || 0,
-    nonce: getCombinedNonce() || 0,
+    nonce: getCombinedNonce(),
     isLoading: balanceLoading || stagingLoading,
     refresh,
     error: balanceError || stagingError
@@ -230,7 +248,10 @@ export function useTransactionHistory() {
     fetcher,
     {
       refreshInterval: 30000,
-      revalidateOnFocus: false
+      revalidateOnFocus: false,
+      onErrorRetry: (error) => {
+        if (error.message.includes('Unknown route')) return;
+      }
     }
   );
 
@@ -448,7 +469,8 @@ export function useSendTransaction() {
         method: 'POST', 
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`
+          'Authorization': `Bearer ${wallet.privateKey}`,
+          'X-Private-Key': wallet.privateKey
         }, 
         body: JSON.stringify({ 
           method: 'POST', 
@@ -549,7 +571,8 @@ export function useEncryptDecrypt() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`
+          'Authorization': `Bearer ${wallet.privateKey}`,
+          'X-Private-Key': wallet.privateKey
         },
         body: JSON.stringify({
           method: 'GET',
@@ -596,7 +619,8 @@ export function useEncryptDecrypt() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`
+          'Authorization': `Bearer ${wallet.privateKey}`,
+          'X-Private-Key': wallet.privateKey
         },
         body: JSON.stringify({
           method: 'POST',
@@ -679,7 +703,10 @@ export function useEncryptedBalance() {
     fetcher,
     { 
       refreshInterval: 30000,
-      revalidateOnFocus: false
+      revalidateOnFocus: false,
+      onErrorRetry: (error) => {
+        if (error.message.includes('Unknown route')) return;
+      }
     }
   );
 
@@ -725,7 +752,8 @@ export function usePrivateTransfers() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`
+          'Authorization': `Bearer ${wallet.privateKey}`,
+          'X-Private-Key': wallet.privateKey
         },
         body: JSON.stringify({
           method: 'GET',
@@ -736,6 +764,9 @@ export function usePrivateTransfers() {
       
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
+        if (response.status === 500 && error.error?.includes('Unknown route')) {
+          return [];
+        }
         throw new Error(error.error || 'Failed to fetch pending transfers');
       }
       
@@ -758,7 +789,8 @@ export function usePrivateTransfers() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`
+          'Authorization': `Bearer ${wallet.privateKey}`,
+          'X-Private-Key': wallet.privateKey
         },
         body: JSON.stringify({
           method: 'POST',
