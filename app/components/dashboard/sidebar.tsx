@@ -4,10 +4,13 @@ import { Separator } from "@/components/ui/separator";
 import { Copy, Droplets, Send, Lock, Unlock, Download, Gift, Shield, RefreshCw } from "lucide-react";
 import { Label } from "@/components/ui/label";
 import { SendDialog } from "./send-dialog";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { useWallet } from "@/context/WalletContext";
 import { useWalletBalance, useEncryptedBalance } from "@/hooks/use-wallet-data";
-import { Skeleton } from "@/components/ui/skeleton";
+import { useState, useEffect } from "react";
+import { Input } from "@/components/ui/input";
+import { saveAs } from "file-saver";
 import {
   Dialog,
   DialogContent,
@@ -17,64 +20,17 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { useState, useEffect, useCallback } from "react";
-import { Input } from "@/components/ui/input";
-import { saveAs } from "file-saver";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { getKeyPair } from "@/lib/crypto";
-import nacl from "tweetnacl";
-import { encodeBase64 } from "tweetnacl-util";
-import { sha256 } from 'js-sha256';
 
-const deriveEncryptionKey = (privkey: string): Uint8Array => {
-  try {
-    const privkeyBytes = new TextEncoder().encode(privkey);
-    const salt = new TextEncoder().encode("octra_encrypted_balance_v2");
-    const combined = new Uint8Array(salt.length + privkeyBytes.length);
-    combined.set(salt);
-    combined.set(privkeyBytes, salt.length);
-    return new Uint8Array(sha256.arrayBuffer(combined)).slice(0, nacl.secretbox.keyLength);
-  } catch (error) {
-    console.error('Key derivation error:', error);
-    throw new Error('Failed to derive encryption key');
-  }
-};
-
-const encryptBalanceValue = (balance: number, privkey: string): string => {
-  try {
-    const key = deriveEncryptionKey(privkey);
-    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
-    const plaintext = new TextEncoder().encode(balance.toString());
-    const ciphertext = nacl.secretbox(plaintext, nonce, key);
-    
-    if (!ciphertext) {
-      throw new Error('Encryption failed - no ciphertext generated');
-    }
-
-    const combined = new Uint8Array(nonce.length + ciphertext.length);
-    combined.set(nonce);
-    combined.set(ciphertext, nonce.length);
-    return "v2|" + encodeBase64(combined);
-  } catch (error) {
-    console.error('Encryption error:', error);
-    throw new Error('Failed to encrypt balance');
-  }
-};
+const MU_FACTOR = 1_000_000;
 
 export function Sidebar() {
   const { wallet, refreshEncryptedBalance } = useWallet();
   const { 
-    nonce, 
-    isLoading: balanceLoading, 
+    publicBalance = 0, 
     refresh: refreshPublicBalance 
   } = useWalletBalance();
   const { 
-    publicBalance = 0, 
     encryptedBalance: encryptedBal = 0,
-    totalBalance = 0,
-    isLoading: encryptedBalanceLoading,
     error: encryptedBalanceError
   } = useEncryptedBalance();
   
@@ -91,9 +47,39 @@ export function Sidebar() {
   const [message, setMessage] = useState("");
   const [pendingTransfers, setPendingTransfers] = useState<any[]>([]);
 
-  const maxEncryptable = Math.max(0, Number(publicBalance) - 1.0);
+  const maxEncryptable = Math.max(0, publicBalance - 1.0);
 
-  const refreshAllBalances = useCallback(async () => {
+  const makeProxyRequest = async (method: string, endpoint: string, payload?: any) => {
+    if (!wallet?.privateKey) {
+      throw new Error("Wallet not connected");
+    }
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${wallet.privateKey}`,
+      'X-Private-Key': wallet.privateKey
+    };
+
+    const response = await fetch('/api/proxy', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        method,
+        endpoint,
+        rpcUrl: 'https://octra.network',
+        payload
+      })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Request failed");
+    }
+
+    return response.json();
+  };
+
+  const refreshAllBalances = async () => {
     try {
       await Promise.all([
         refreshPublicBalance(),
@@ -102,19 +88,7 @@ export function Sidebar() {
     } catch (error) {
       console.error('Balance refresh error:', error);
     }
-  }, [refreshPublicBalance, refreshEncryptedBalance]);
-
-  useEffect(() => {
-    if (!wallet?.address) return;
-
-    const interval = setInterval(() => {
-      refreshAllBalances().catch(error => {
-        console.error('Auto-refresh error:', error);
-      });
-    }, 30000);
-
-    return () => clearInterval(interval);
-  }, [wallet?.address, refreshAllBalances]);
+  };
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -146,118 +120,27 @@ export function Sidebar() {
     }
 
     if (amt > maxEncryptable) {
-      setMessage(`Amount exceeds maximum encryptable balance (${safeToFixed(maxEncryptable)}) OCT`);
+      setMessage(`Amount exceeds maximum encryptable balance (${safeToFixed(maxEncryptable)} OCT)`);
       return;
     }
 
     setLoading(true);
     setMessage("");
     try {
-      let balanceResponse: Response | null = null;
-      let retries = 0;
-      const maxRetries = 3;
-      
-      while (retries <= maxRetries) {
-        try {
-          const response = await fetch('/api/proxy', {
-            method: 'POST',
-            headers: { 
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${wallet.privateKey}`,
-              'X-Private-Key': wallet.privateKey
-            },
-            body: JSON.stringify({
-              method: 'GET',
-              endpoint: `/view_encrypted_balance/${wallet.address}`,
-              rpcUrl: 'https://octra.network'
-            }),
-            signal: AbortSignal.timeout(15000)
-          });
-
-          if (response.ok) {
-            balanceResponse = response;
-            break;
-          }
-          
-          if (retries === maxRetries) {
-            throw new Error("Failed to get encrypted balance after retries");
-          }
-        } catch (error) {
-          if (retries === maxRetries) {
-            throw error;
-          }
-          await new Promise(resolve => setTimeout(resolve, 2000 * (retries + 1)));
-        }
-        retries++;
-      }
-
-      if (!balanceResponse) {
-        throw new Error("No response received");
-      }
-
-      const balanceData = await balanceResponse.json();
-      const currentEncryptedRaw = parseInt(balanceData.encrypted_balance_raw || '0');
-      const amountRaw = Math.floor(amt * 1000000);
-      const newEncryptedRaw = currentEncryptedRaw + amountRaw;
-
-      const encryptedData = encryptBalanceValue(newEncryptedRaw, wallet.privateKey);
-
-      const keyPair = getKeyPair(wallet.privateKey);
-      const timestamp = Date.now();
-      const message = JSON.stringify({
+      const amountRaw = Math.floor(amt * MU_FACTOR);
+      await makeProxyRequest('POST', '/encrypt_balance', {
         address: wallet.address,
-        amount: amountRaw,
-        new_balance: newEncryptedRaw,
-        timestamp
+        amount: amountRaw.toString(),
+        private_key: wallet.privateKey
       });
-      const signature = nacl.sign.detached(
-        new TextEncoder().encode(message),
-        keyPair.secretKey
-      );
-
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`,
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'POST',
-          endpoint: '/encrypt_balance',
-          rpcUrl: 'https://octra.network',
-          payload: {
-            address: wallet.address,
-            amount: amountRaw.toString(),
-            private_key: wallet.privateKey,
-            encrypted_data: encryptedData,
-            signature: encodeBase64(signature),
-            public_key: wallet.publicKey,
-            timestamp
-          }
-        }),
-        signal: AbortSignal.timeout(20000)
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || "Encryption failed");
-      }
-
-      const result = await response.json();
-      if (result.error) {
-        throw new Error(result.error);
-      }
 
       setMessage(`Successfully encrypted ${safeToFixed(amt)} OCT`);
       setTimeout(refreshAllBalances, 2000);
       setEncryptOpen(false);
       setAmount("");
-    } catch (error: unknown) {
+    } catch (error: any) {
       console.error('Encryption error:', error);
-      setMessage(
-        error instanceof Error ? error.message : "Encryption failed. Please try again."
-      );
+      setMessage(error.message || "Encryption failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -281,123 +164,27 @@ export function Sidebar() {
     }
 
     if (amt > Number(encryptedBal)) {
-      setMessage(`Amount exceeds encrypted balance (${safeToFixed(encryptedBal)}) OCT`);
+      setMessage(`Amount exceeds encrypted balance (${safeToFixed(encryptedBal)} OCT)`);
       return;
     }
 
     setLoading(true);
     setMessage("");
     try {
-      let balanceResponse: Response | null = null;
-      let retries = 0;
-      const maxRetries = 3;
-      
-      while (retries <= maxRetries) {
-        try {
-          const response = await fetch('/api/proxy', {
-            method: 'POST',
-            headers: { 
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${wallet.privateKey}`,
-              'X-Private-Key': wallet.privateKey
-            },
-            body: JSON.stringify({
-              method: 'GET',
-              endpoint: `/view_encrypted_balance/${wallet.address}`,
-              rpcUrl: 'https://octra.network'
-            }),
-            signal: AbortSignal.timeout(15000)
-          });
-
-          if (response.ok) {
-            balanceResponse = response;
-            break;
-          }
-          
-          if (retries === maxRetries) {
-            throw new Error("Failed to get encrypted balance after retries");
-          }
-        } catch (error) {
-          if (retries === maxRetries) {
-            throw error;
-          }
-          await new Promise(resolve => setTimeout(resolve, 2000 * (retries + 1)));
-        }
-        retries++;
-      }
-
-      if (!balanceResponse) {
-        throw new Error("No response received");
-      }
-
-      const balanceData = await balanceResponse.json();
-      const currentEncryptedRaw = parseInt(balanceData.encrypted_balance_raw || '0');
-      const amountRaw = Math.floor(amt * 1000000);
-      
-      if (currentEncryptedRaw < amountRaw) {
-        throw new Error("Insufficient encrypted balance");
-      }
-      
-      const newEncryptedRaw = currentEncryptedRaw - amountRaw;
-
-      const encryptedData = encryptBalanceValue(newEncryptedRaw, wallet.privateKey);
-
-      const keyPair = getKeyPair(wallet.privateKey);
-      const timestamp = Date.now();
-      const message = JSON.stringify({
+      const amountRaw = Math.floor(amt * MU_FACTOR);
+      await makeProxyRequest('POST', '/decrypt_balance', {
         address: wallet.address,
-        amount: amountRaw,
-        new_balance: newEncryptedRaw,
-        timestamp
+        amount: amountRaw.toString(),
+        private_key: wallet.privateKey
       });
-      const signature = nacl.sign.detached(
-        new TextEncoder().encode(message),
-        keyPair.secretKey
-      );
-
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`,
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'POST',
-          endpoint: '/decrypt_balance',
-          rpcUrl: 'https://octra.network',
-          payload: {
-            address: wallet.address,
-            amount: amountRaw.toString(),
-            private_key: wallet.privateKey,
-            encrypted_data: encryptedData,
-            signature: encodeBase64(signature),
-            public_key: wallet.publicKey,
-            timestamp
-          }
-        }),
-        signal: AbortSignal.timeout(20000)
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || "Decryption failed");
-      }
-
-      const result = await response.json();
-      if (result.error) {
-        throw new Error(result.error);
-      }
 
       setMessage(`Successfully decrypted ${safeToFixed(amt)} OCT`);
       setTimeout(refreshAllBalances, 2000);
       setDecryptOpen(false);
       setAmount("");
-    } catch (error: unknown) {
+    } catch (error: any) {
       console.error('Decryption error:', error);
-      setMessage(
-        error instanceof Error ? error.message : "Decryption failed. Please try again."
-      );
+      setMessage(error.message || "Decryption failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -421,76 +208,29 @@ export function Sidebar() {
     }
 
     if (amt > Number(encryptedBal)) {
-      setMessage(`Amount exceeds encrypted balance (${safeToFixed(encryptedBal)}) OCT`);
+      setMessage(`Amount exceeds encrypted balance (${safeToFixed(encryptedBal)} OCT)`);
       return;
     }
 
     setLoading(true);
     setMessage("");
     try {
-      const amountRaw = Math.floor(amt * 1000000);
-      const timestamp = Math.floor(Date.now() / 1000);
-      const nonce = Date.now();
-
-      const keyPair = getKeyPair(wallet.privateKey);
-      const messageObj = {
+      const amountRaw = Math.floor(amt * MU_FACTOR);
+      await makeProxyRequest('POST', '/private_transfer', {
         from: wallet.address,
         to: recipient,
-        amount: amountRaw,
-        timestamp,
-        nonce
-      };
-      const signature = nacl.sign.detached(
-        new TextEncoder().encode(JSON.stringify(messageObj)),
-        keyPair.secretKey
-      );
-
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`,
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'POST',
-          endpoint: '/private_transfer',
-          rpcUrl: 'https://octra.network',
-          payload: {
-            from: wallet.address,
-            to: recipient,
-            amount: amountRaw.toString(),
-            from_private_key: wallet.privateKey,
-            signature: encodeBase64(signature),
-            public_key: wallet.publicKey,
-            timestamp,
-            nonce,
-            message: ""
-          }
-        }),
-        signal: AbortSignal.timeout(20000)
+        amount: amountRaw.toString(),
+        from_private_key: wallet.privateKey
       });
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || "Private transfer failed");
-      }
-
-      const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error);
-      }
-
-      setMessage(`Private transfer submitted! Transaction hash: ${data.tx_hash || 'pending'}`);
+      setMessage("Private transfer submitted!");
       setTimeout(refreshEncryptedBalance, 2000);
       setPrivateTransferOpen(false);
       setRecipient("");
       setAmount("");
-    } catch (error: unknown) {
+    } catch (error: any) {
       console.error('Private transfer error:', error);
-      setMessage(
-        error instanceof Error ? error.message : "Private transfer failed. Please try again."
-      );
+      setMessage(error.message || "Private transfer failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -502,39 +242,11 @@ export function Sidebar() {
     setLoading(true);
     setMessage("");
     try {
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`,
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'GET',
-          endpoint: `/pending_private_transfers/${wallet.address}`,
-          rpcUrl: 'https://octra.network'
-        }),
-        signal: AbortSignal.timeout(10000)
-      });
-      
-      if (!response.ok) {
-        if (response.status === 500) {
-          const errorData = await response.json().catch(() => ({}));
-          if (errorData.error?.includes("Unknown route")) {
-            setPendingTransfers([]);
-            return;
-          }
-        }
-        throw new Error("Failed to load transfers");
-      }
-
-      const data = await response.json();
+      const data = await makeProxyRequest('GET', `/pending_private_transfers/${wallet.address}`);
       setPendingTransfers(data.pending_transfers || []);
-    } catch (error: unknown) {
+    } catch (error: any) {
       console.error('Failed to load transfers:', error);
-      setMessage(
-        error instanceof Error ? error.message : "Failed to load transfers"
-      );
+      setMessage(error.message || "Failed to load transfers");
       setPendingTransfers([]);
     } finally {
       setLoading(false);
@@ -550,41 +262,19 @@ export function Sidebar() {
     setLoading(true);
     setMessage("");
     try {
-      const response = await fetch('/api/proxy', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${wallet.privateKey}`,
-          'X-Private-Key': wallet.privateKey
-        },
-        body: JSON.stringify({
-          method: 'POST',
-          endpoint: '/claim_private_transfer',
-          rpcUrl: 'https://octra.network',
-          payload: {
-            recipient_address: wallet.address,
-            private_key: wallet.privateKey,
-            transfer_id: claimId
-          }
-        }),
-        signal: AbortSignal.timeout(15000)
+      await makeProxyRequest('POST', '/claim_private_transfer', {
+        recipient_address: wallet.address,
+        private_key: wallet.privateKey,
+        transfer_id: claimId
       });
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || "Claim failed");
-      }
-
-      const data = await response.json();
-      setMessage(`Successfully claimed transfer! Amount: ${safeToFixed(data.amount)} OCT`);
+      setMessage("Successfully claimed transfer!");
       await refreshAllBalances();
       await loadPendingTransfers();
       setClaimId("");
-    } catch (error: unknown) {
+    } catch (error: any) {
       console.error('Claim error:', error);
-      setMessage(
-        error instanceof Error ? error.message : "Claim failed"
-      );
+      setMessage(error.message || "Claim failed");
     } finally {
       setLoading(false);
     }
@@ -648,49 +338,30 @@ export function Sidebar() {
       <CardContent className="space-y-6">
         <div className="space-y-1">
           <Label className="text-sm font-medium text-muted-foreground">Public Balance</Label>
-          {balanceLoading ? <Skeleton className="h-8 w-3/4" /> : (
-            <div className="flex items-center gap-2">
-              <p className="text-2xl font-bold">{safeToFixed(publicBalance)} OCT</p>
-              <Button 
-                variant="ghost" 
-                size="icon" 
-                onClick={refreshPublicBalance}
-                disabled={balanceLoading}
-              >
-                <RefreshCw className={`w-4 h-4 ${balanceLoading ? 'animate-spin' : ''}`} />
-              </Button>
-            </div>
-          )}
+          <div className="flex items-center gap-2">
+            <p className="text-2xl font-bold">{safeToFixed(publicBalance)} OCT</p>
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={refreshPublicBalance}
+            >
+              <RefreshCw className="w-4 h-4" />
+            </Button>
+          </div>
         </div>
         
         <div className="space-y-1">
           <Label className="text-sm font-medium text-muted-foreground">Encrypted Balance</Label>
-          {encryptedBalanceLoading ? <Skeleton className="h-8 w-3/4" /> : (
-            <div className="flex items-center gap-2">
-              <p className="text-2xl font-bold text-yellow-600">{safeToFixed(encryptedBal)} OCT</p>
-              <Badge variant="secondary" className="text-xs">Private</Badge>
-              <Button 
-                variant="ghost" 
-                size="icon" 
-                onClick={refreshEncryptedBalance}
-                disabled={encryptedBalanceLoading}
-              >
-                <RefreshCw className={`w-4 h-4 ${encryptedBalanceLoading ? 'animate-spin' : ''}`} />
-              </Button>
-            </div>
-          )}
-        </div>
-        
-        <div className="space-y-1">
-          <Label className="text-sm font-medium text-muted-foreground">Total Balance</Label>
-          {encryptedBalanceLoading ? <Skeleton className="h-8 w-3/4" /> : (
-            <p className="text-2xl font-bold">{safeToFixed(totalBalance)} OCT</p>
-          )}
-        </div>
-        
-        <div className="space-y-1">
-          <Label className="text-sm font-medium text-muted-foreground">Nonce</Label>
-          {balanceLoading ? <Skeleton className="h-7 w-1/4" /> : <p className="text-lg font-mono">{nonce}</p>}
+          <div className="flex items-center gap-2">
+            <p className="text-2xl font-bold text-yellow-600">{safeToFixed(encryptedBal)} OCT</p>
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={refreshEncryptedBalance}
+            >
+              <RefreshCw className="w-4 h-4" />
+            </Button>
+          </div>
         </div>
         
         <Separator />
@@ -704,21 +375,14 @@ export function Sidebar() {
             >
               {wallet?.address ? `${wallet.address.substring(0, 12)}...${wallet.address.substring(wallet.address.length - 8)}` : 'Not connected'}
             </p>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button 
-                    variant="ghost" 
-                    size="icon" 
-                    onClick={() => wallet?.address && handleCopy(wallet.address)}
-                    disabled={!wallet?.address}
-                  >
-                    <Copy className="w-4 h-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent><p>Copy Address</p></TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={() => wallet?.address && handleCopy(wallet.address)}
+              disabled={!wallet?.address}
+            >
+              <Copy className="w-4 h-4" />
+            </Button>
           </div>
         </div>
         
@@ -728,21 +392,14 @@ export function Sidebar() {
             <p className="text-sm font-mono break-all text-muted-foreground">
               {wallet?.publicKey ? `${wallet.publicKey.substring(0, 12)}...` : 'Not connected'}
             </p>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button 
-                    variant="ghost" 
-                    size="icon" 
-                    onClick={() => wallet?.publicKey && handleCopy(wallet.publicKey)}
-                    disabled={!wallet?.publicKey}
-                  >
-                    <Copy className="w-4 h-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent><p>Copy Public Key</p></TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={() => wallet?.publicKey && handleCopy(wallet.publicKey)}
+              disabled={!wallet?.publicKey}
+            >
+              <Copy className="w-4 h-4" />
+            </Button>
           </div>
         </div>
         
@@ -931,7 +588,7 @@ export function Sidebar() {
                               From: {transfer.sender.substring(0, 12)}...{transfer.sender.slice(-8)}
                             </p>
                             <p className="text-sm text-muted-foreground">
-                              Amount: {safeToFixed(transfer.amount / 1000000)} OCT
+                              Amount: {safeToFixed(transfer.amount / MU_FACTOR)} OCT
                             </p>
                           </div>
                           <Button

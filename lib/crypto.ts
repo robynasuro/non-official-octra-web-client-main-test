@@ -37,8 +37,8 @@ export function validatePrivateKey(privateKeyB64: string): boolean {
       throw new Error(`Invalid key length. Expected 32 or 64 bytes, got ${decodedKey.length}`);
     }
     return true;
-  } catch (error: unknown) {
-    throw new Error(`Invalid private key: ${error instanceof Error ? error.message : String(error)}`);
+  } catch (_error) {
+    throw new Error('Invalid private key format');
   }
 }
 
@@ -54,8 +54,8 @@ export function getKeyPair(privateKeyB64: string): SignKeyPair {
     const decodedKey = decodeBase64(privateKeyB64);
     return sign.keyPair.fromSeed(decodedKey);
   } catch (error: unknown) {
-    console.error('Key pair generation error:', error);
-    throw new Error(`Failed to generate key pair: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Key pair generation error');
+    throw new Error('Failed to generate key pair');
   }
 }
 
@@ -70,8 +70,8 @@ export function derivePublicKey(privateKeyB64: string): string {
     const keyPair = getKeyPair(privateKeyB64);
     return encodeBase64(keyPair.publicKey);
   } catch (error: unknown) {
-    console.error('Public key derivation error:', error);
-    throw new Error(`Failed to derive public key: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Public key derivation error');
+    throw new Error('Failed to derive public key');
   }
 }
 
@@ -88,8 +88,8 @@ export function deriveAddress(privateKeyB64: string): string {
     const base58Hash = base58.encode(hash);
     return 'oct' + base58Hash;
   } catch (error: unknown) {
-    console.error('Address derivation error:', error);
-    throw new Error(`Failed to derive address: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Address derivation error');
+    throw new Error('Failed to derive address');
   }
 }
 
@@ -111,29 +111,18 @@ export function derivePrivateKeyFromMnemonic(mnemonic: string): string {
     const privateKeyRaw = Buffer.from(keyPair.secretKey.slice(0, 32));
     return encodeBase64(privateKeyRaw);
   } catch (error: unknown) {
-    console.error('Private key derivation error:', error);
-    throw new Error(`Failed to derive private key: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Private key derivation error');
+    throw new Error('Failed to derive private key');
   }
 }
 
-/**
- * Generates cryptographic entropy
- * @param {number} strength - Strength in bits (default: 128)
- * @returns {Buffer} Random bytes buffer
- * @throws {Error} If invalid strength is provided
- */
 function generateEntropy(strength: number = 128): Buffer {
   if (![128, 160, 192, 224, 256].includes(strength)) {
-    throw new Error("Strength must be one of: 128, 160, 192, 224, or 256 bits");
+    throw new Error("Invalid entropy strength");
   }
   return randomBytes(strength / 8);
 }
 
-/**
- * Derives master key using HMAC-SHA512 with "Octra seed"
- * @param {Buffer} seed - The seed buffer
- * @returns {MasterKey} Object containing master private key and chain code
- */
 function deriveMasterKey(seed: Buffer): MasterKey {
   try {
     const key = Buffer.from("Octra seed", "utf8");
@@ -142,33 +131,21 @@ function deriveMasterKey(seed: Buffer): MasterKey {
       masterPrivateKey: mac.slice(0, 32),
       masterChainCode: mac.slice(32, 64)
     };
-  } catch (error: unknown) {
-    console.error('Master key derivation error:', error);
-    throw new Error(`Failed to derive master key: ${error instanceof Error ? error.message : String(error)}`);
+  } catch (_error) {
+    throw new Error('Failed to derive master key');
   }
 }
 
-/**
- * Creates an Octra address from a public key
- * @param {Buffer} publicKey - The public key buffer
- * @returns {string} The Octra address (oct + Base58(SHA256(pubkey)))
- */
 function createOctraAddress(publicKey: Buffer): string {
   try {
     const hash = createHash("sha256").update(publicKey).digest();
     const base58Hash = base58.encode(hash);
     return "oct" + base58Hash;
-  } catch (error: unknown) {
-    console.error('Address creation error:', error);
-    throw new Error(`Failed to create address: ${error instanceof Error ? error.message : String(error)}`);
+  } catch (_error) {
+    throw new Error('Failed to create address');
   }
 }
 
-/**
- * Converts a buffer to hex string
- * @param {Buffer | Uint8Array} buffer - The buffer to convert
- * @returns {string} Hex string representation
- */
 function bufferToHex(buffer: Buffer | Uint8Array): string {
   return Buffer.from(buffer).toString("hex");
 }
@@ -212,8 +189,8 @@ export function createWallet(): WalletData {
       signature_valid: signatureValid,
     };
   } catch (error: unknown) {
-    console.error('Wallet creation error:', error);
-    throw new Error(`Failed to create wallet: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Wallet creation error');
+    throw new Error('Failed to create wallet');
   }
 }
 
@@ -227,8 +204,8 @@ export function validateAddress(address: string): boolean {
     if (!address.startsWith('oct')) return false;
     const hashPart = address.slice(3);
     const decoded = base58.decode(hashPart);
-    return decoded.length === 32; // SHA256 hash length
-  } catch (error) {
+    return decoded.length === 32;
+  } catch (_error) {
     return false;
   }
 }
@@ -247,8 +224,8 @@ export function signMessage(message: string, privateKeyB64: string): string {
     const signature = sign.detached(messageBytes, keyPair.secretKey);
     return encodeBase64(signature);
   } catch (error: unknown) {
-    console.error('Message signing error:', error);
-    throw new Error(`Failed to sign message: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Message signing error');
+    throw new Error('Failed to sign message');
   }
 }
 
@@ -271,7 +248,7 @@ export function verifySignature(
     const publicKey = decodeBase64(publicKeyB64);
     return sign.detached.verify(messageBytes, signature, publicKey);
   } catch (error: unknown) {
-    console.error('Signature verification error:', error);
-    throw new Error(`Failed to verify signature: ${error instanceof Error ? error.message : String(error)}`);
+    console.error('Signature verification error');
+    throw new Error('Failed to verify signature');
   }
 }
